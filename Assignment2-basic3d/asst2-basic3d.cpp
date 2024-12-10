@@ -512,21 +512,21 @@ static void keyboard(const unsigned char key, const int x, const int y) {
         }
 
         // 추가적인 조건 설정
-        if (relativeYPositions[1] < 11) {
-            // 2번 벽과의 Y좌표가 11보다 작으면 1번과 3번 벽만 체크
+        if (relativeYPositions[1] < 10.5) {
+            // 2번 벽과의 Y좌표가 10.5보다 작으면 1번과 3번 벽만 체크
             if (relativeYPositions[0] <= 0.5 || relativeYPositions[2] <= 0.5) {
                 return false; // 1번 또는 3번 벽의 Y좌표가 음수라면 이동 불가
             }
         }
-        else if (relativeYPositions[1] > 15) {
-            // 2번 벽과의 거리가 15보다 크면 1번과 3번 벽만 체크
+        else if (relativeYPositions[1] > 14.5) {
+            // 2번 벽과의 거리가 14.5보다 크면 1번과 3번 벽만 체크
             if (relativeYPositions[0] <= 0.5 || relativeYPositions[2] <= 0.5) {
                 return false; // 1번 또는 3번 벽의 Y좌표가 음수라면 이동 불가
             }
         }
         else {
-            // 2번 벽과의 Y좌표가 11 이상 15 이하일 경우 7번과 9번 벽만 체크
-            if (relativeYPositions[6] <= 0.1 || relativeYPositions[8] <= 0.1) {
+            // 2번 벽과의 Y좌표가 10.5 이상 14.5 이하일 경우 7번과 9번 벽만 체크
+            if (relativeYPositions[6] <= 0.5 || relativeYPositions[8] <= 0.5) {
                 return false; // 7번 또는 9번 벽의 Y좌표가 음수라면 이동 불가
             }
         }
