@@ -1,4 +1,5 @@
 #define _SILENCE_TR1_NAMESPACE_DEPRECATION_WARNING   // to remove tr1 warning
+#define STB_IMAGE_IMPLEMENTATION
 
 #include <vector>
 #include <string>
@@ -20,7 +21,7 @@
 #include "geometrymaker.h"
 #include "ppm.h"
 #include "glsupport2.h"
-
+#include <Windows.h>
 
 using namespace std;      // for string, vector, iostream, and other standard C++ stuff
 using namespace tr1;      // for shared_ptr
@@ -45,6 +46,7 @@ static int g_activeShader = 0;
 static bool g_reverseDirection = false; // 카메라 방향 반전을 위한 플래그
 static double g_pitch = 0.0; // 상하 회전 각도
 static double g_yaw = 0.0;   // 좌우 회전 각도
+
 
 struct ShaderState {
     GlProgram program;
@@ -95,75 +97,79 @@ static const char* const g_shaderFilesGl2[g_numShaders][2] = {
 };
 static vector<shared_ptr<ShaderState> > g_shaderStates; // our global shader states
 
+GLuint wallTextureID;
+
 // --------- Geometry
 
 // Macro used to obtain relative offset of a field within a struct
 #define FIELD_OFFSET(StructType, field) &(((StructType *)0)->field)
 
-// A vertex with floating point position and normal
-struct VertexPN {
-    Cvec3f p, n;
 
-    VertexPN() {}
-    VertexPN(float x, float y, float z,
-        float nx, float ny, float nz)
-        : p(x, y, z), n(nx, ny, nz)
-    {}
+struct VertexPNT {
+    Cvec3f p, n;     // 기존의 위치와 법선
+    Cvec2f t;        // 텍스처 좌표 추가
 
-    // Define copy constructor and assignment operator from GenericVertex so we can
-    // use make* functions from geometrymaker.h
-    VertexPN(const GenericVertex& v) {
+    VertexPNT() {}
+    VertexPNT(float x, float y, float z,
+        float nx, float ny, float nz,
+        float u, float v)
+        : p(x, y, z), n(nx, ny, nz), t(u, v) {}
+
+    VertexPNT(const GenericVertex& v) {
         *this = v;
     }
 
-    VertexPN& operator = (const GenericVertex& v) {
+    VertexPNT& operator=(const GenericVertex& v) {
         p = v.pos;
         n = v.normal;
+        t = v.tex;
         return *this;
     }
 };
+
 struct Geometry {
 
-    GlVertexArrayObject vao; // vao is vertex array object, glGenVertexArrays(1, &vao)
-
-    GlBufferObject vbo, ibo;  // vbo is vertex buffer object, ibo is index buffer object, glGenBuffers(1, &vbo), glGenBuffers(1, &ibo)
+    GlVertexArrayObject vao;
+    GlBufferObject vbo, ibo;
     int vboLen, iboLen;
 
-    Geometry(VertexPN* vtx, unsigned short* idx, int vboLen, int iboLen) {
+    // 수정: VertexPNT를 지원하는 생성자 추가
+    template <typename VertexType>
+    Geometry(VertexType* vtx, unsigned short* idx, int vboLen, int iboLen) {
         this->vboLen = vboLen;
         this->iboLen = iboLen;
 
-        glBindVertexArray(vao); // Bind VAO before creating VBO and IBO, added by DS on oct6, 2024
+        glBindVertexArray(vao);
 
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        glBufferData(GL_ARRAY_BUFFER, sizeof(VertexPN) * vboLen, vtx, GL_STATIC_DRAW);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(VertexType) * vboLen, vtx, GL_STATIC_DRAW);
 
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
         glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(unsigned short) * iboLen, idx, GL_STATIC_DRAW);
     }
 
     void draw(const ShaderState& curSS) {
-
-        // bind vao
-        glBindVertexArray(vao); // Bind VAO before drawing, added by DS on oct6, 2024
-        // Enable the attributes used by our shader
+        glBindVertexArray(vao);
         safe_glEnableVertexAttribArray(curSS.h_aPosition);
         safe_glEnableVertexAttribArray(curSS.h_aNormal);
 
-        // bind vbo
+        GLint h_aTexCoord = safe_glGetAttribLocation(curSS.program, "aTexCoord");
+
         glBindBuffer(GL_ARRAY_BUFFER, vbo);
-        safe_glVertexAttribPointer(curSS.h_aPosition, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPN), FIELD_OFFSET(VertexPN, p));
-        safe_glVertexAttribPointer(curSS.h_aNormal, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPN), FIELD_OFFSET(VertexPN, n));
+        safe_glVertexAttribPointer(curSS.h_aPosition, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPNT), FIELD_OFFSET(VertexPNT, p));
+        safe_glVertexAttribPointer(curSS.h_aNormal, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPNT), FIELD_OFFSET(VertexPNT, n));
 
-        // bind ibo
+        if (h_aTexCoord != -1) { // 텍스처 좌표가 있는 경우
+            safe_glEnableVertexAttribArray(h_aTexCoord);
+            safe_glVertexAttribPointer(h_aTexCoord, 2, GL_FLOAT, GL_FALSE, sizeof(VertexPNT), FIELD_OFFSET(VertexPNT, t));
+        }
+
         glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ibo);
-
-        // draw!
         glDrawElements(GL_TRIANGLES, iboLen, GL_UNSIGNED_SHORT, 0);
 
-        // Disable the attributes used by our shader
         safe_glDisableVertexAttribArray(curSS.h_aPosition);
         safe_glDisableVertexAttribArray(curSS.h_aNormal);
+        if (h_aTexCoord != -1) safe_glDisableVertexAttribArray(h_aTexCoord);
     }
 };
 
@@ -173,20 +179,17 @@ static shared_ptr<Geometry> g_ground;
 
 // --------- Scene
 
-//static const Cvec3 g_light1(2.0, 3.0, 14.0), g_light2(-2, -3.0, -5.0);  // define two lights positions in world space
 static const Cvec3 g_light1(5.0, 5.0, 6.0), g_light2(-7.0, -2.0, -10.0);  // define two lights positions in world space
 
 static Matrix4 g_skyRbt = Matrix4::makeTranslation(Cvec3(0.0, 0.0, 3.0));
-//static Matrix4 g_objectRbt[1] = { Matrix4::makeTranslation(Cvec3(-1,0,-1)) * Matrix4::makeXRotation(22.0) };  // currently only 1 obj is defined
-//static Cvec3f g_objectColors[1] = { Cvec3f(1, 0, 0) };
+
 
 static void initGround() {
-    // A x-z plane at y = g_groundY of dimension [-g_groundSize, g_groundSize]^2
-    VertexPN vtx[4] = {
-      VertexPN(-g_groundSize, g_groundY, -g_groundSize, 0, 1, 0),
-      VertexPN(-g_groundSize, g_groundY,  g_groundSize, 0, 1, 0),
-      VertexPN(g_groundSize, g_groundY,  g_groundSize, 0, 1, 0),
-      VertexPN(g_groundSize, g_groundY, -g_groundSize, 0, 1, 0),
+    VertexPNT vtx[4] = {
+        VertexPNT(-g_groundSize, g_groundY, -g_groundSize, 0, 1, 0, 0, 0),
+        VertexPNT(-g_groundSize, g_groundY,  g_groundSize, 0, 1, 0, 0, 1),
+        VertexPNT(g_groundSize, g_groundY,  g_groundSize, 0, 1, 0, 1, 1),
+        VertexPNT(g_groundSize, g_groundY, -g_groundSize, 0, 1, 0, 1, 0),
     };
     unsigned short idx[] = { 0, 1, 2, 0, 2, 3 };
     g_ground.reset(new Geometry(&vtx[0], &idx[0], 4, 6));
@@ -219,11 +222,13 @@ static void updateFrustFovY() {
     }
 }
 
+
 static Matrix4 makeProjectionMatrix() {
     return Matrix4::makeProjection(
         g_frustFovY, g_windowWidth / static_cast <double> (g_windowHeight),
         g_frustNear, g_frustFar);
 }
+
 
 static void drawAxes(const ShaderState& curSS, const Matrix4& objectRbt) {
     const float axisLength = 1.0f; // 축의 길이
@@ -258,57 +263,102 @@ static void drawAxes(const ShaderState& curSS, const Matrix4& objectRbt) {
     glLineWidth(1.0); // 선 굵기 초기화
 }
 
-static shared_ptr<Geometry> createPlane(float width, float height) {
-    // 정점 데이터 정의
-    VertexPN vtx[4] = {
-        VertexPN(-width / 2, 0.0, -height / 2, 0, 1, 0),  // 왼쪽 아래
-        VertexPN(width / 2, 0.0, -height / 2, 0, 1, 0),   // 오른쪽 아래
-        VertexPN(width / 2, 0.0, height / 2, 0, 1, 0),    // 오른쪽 위
-        VertexPN(-width / 2, 0.0, height / 2, 0, 1, 0),   // 왼쪽 위
+
+static void loadTexture(const char* filename, GLuint& textureID) {
+    int width, height;
+    vector<PackedPixel> pixData;
+
+    // PPM 이미지 읽기
+    ppmRead(filename, width, height, pixData);
+
+    // 텍스처 생성 및 바인딩
+    glGenTextures(1, &textureID);
+    glBindTexture(GL_TEXTURE_2D, textureID);
+
+    // 텍스처 데이터 설정
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, &pixData[0]);
+
+    // 텍스처 필터링 및 래핑 설정
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+
+static shared_ptr<Geometry> createTexturedPlane(float width, float height) {
+    VertexPNT vtx[4] = {
+        VertexPNT(-width / 2, 0.0, -height / 2, 0, 1, 0, 0, 0),   // 왼쪽 아래
+        VertexPNT(width / 2, 0.0, -height / 2, 0, 1, 0, 1, 0),    // 오른쪽 아래
+        VertexPNT(width / 2, 0.0, height / 2, 0, 1, 0, 1, 1),     // 오른쪽 위
+        VertexPNT(-width / 2, 0.0, height / 2, 0, 1, 0, 0, 1),    // 왼쪽 위
     };
 
-    // 삼각형 인덱스 정의
     unsigned short idx[] = { 0, 1, 2, 0, 2, 3 };
 
-    // Geometry 객체 생성 및 반환
     return make_shared<Geometry>(&vtx[0], &idx[0], 4, 6);
 }
 
-static void drawPlane(const ShaderState& curSS, shared_ptr<Geometry> plane, const Matrix4& transform, const Cvec3& color) {
-    // 모델-뷰 변환 행렬 계산
+
+static void drawPlane(const ShaderState& curSS, shared_ptr<Geometry> plane, const Matrix4& transform) {
+    glActiveTexture(GL_TEXTURE0); // 텍스처 유닛 0 활성화
+    glBindTexture(GL_TEXTURE_2D, wallTextureID); // 텍스처 바인딩
+
+    GLint uTextureLoc = safe_glGetUniformLocation(curSS.program, "uTexture");
+    if (uTextureLoc != -1) {
+        glUniform1i(uTextureLoc, 0); // uTexture 유니폼에 텍스처 유닛 0 연결
+    }
+
+    // MVM 계산
     Matrix4 MVM = inv(g_skyRbt) * transform;
     Matrix4 NMVM = normalMatrix(MVM);
-
-    // 셰이더로 변환 행렬 및 색상 전달
     sendModelViewNormalMatrix(curSS, MVM, NMVM);
-    safe_glUniform3f(curSS.h_uColor, color[0], color[1], color[2]);
 
     // 플레인 그리기
     plane->draw(curSS);
 }
 
-void createStructure(const ShaderState& curSS, const Matrix4& transform, const Cvec3& baseColor, vector<Matrix4>& planeTransforms) {
+
+
+
+//static void drawPlane(const ShaderState& curSS, shared_ptr<Geometry> plane, const Matrix4& transform) {
+//    // 텍스처 활성화 및 바인딩
+//    glActiveTexture(GL_TEXTURE0); // 텍스처 유닛 0 활성화
+//    glBindTexture(GL_TEXTURE_2D, wallTextureID); // 텍스처 바인딩
+//    glUniform1i(safe_glGetUniformLocation(curSS.program, "uTexture"), 0); // 셰이더의 uTexture에 텍스처 유닛 0 연결
+//
+//    // 모델-뷰 변환 행렬 계산
+//    Matrix4 MVM = inv(g_skyRbt) * transform;
+//    Matrix4 NMVM = normalMatrix(MVM);
+//
+//    // 셰이더로 변환 행렬 전달
+//    sendModelViewNormalMatrix(curSS, MVM, NMVM);
+//
+//    // 플레인 그리기
+//    plane->draw(curSS);
+//}
+
+
+void createStructure(const ShaderState& curSS, const Matrix4& transform, vector<Matrix4>& planeTransforms) {
     // wall_1
-    auto leftPlane = createPlane(5.0, 10.0);
+    auto leftPlane = createTexturedPlane(5.0, 10.0);
     Matrix4 leftTransform = transform * Matrix4::makeTranslation(Cvec3(-2.5, 0.5, -7.5)) * Matrix4::makeZRotation(-90);
-    drawPlane(curSS, leftPlane, leftTransform, baseColor);
-    //drawAxes(curSS, leftTransform);
+    drawPlane(curSS, leftPlane, leftTransform);
     planeTransforms.push_back(leftTransform);
 
     // wall_2
-    auto facePlane = createPlane(5.0, 5.0);
+    auto facePlane = createTexturedPlane(5.0, 5.0);
     Matrix4 faceTransform = transform * Matrix4::makeTranslation(Cvec3(0.0, 0.5, -12.5)) * Matrix4::makeXRotation(90);
-    drawPlane(curSS, facePlane, faceTransform, baseColor);
-    //drawAxes(curSS, faceTransform);
+    drawPlane(curSS, facePlane, faceTransform);
     planeTransforms.push_back(faceTransform);
 
     // wall_3
-    auto rightPlane = createPlane(5.0, 10.0);
+    auto rightPlane = createTexturedPlane(5.0, 10.0);
     Matrix4 rightTransform = transform * Matrix4::makeTranslation(Cvec3(2.5, 0.5, -7.5)) * Matrix4::makeZRotation(90);
-    drawPlane(curSS, rightPlane, rightTransform, baseColor);
-    //drawAxes(curSS, rightTransform);
+    drawPlane(curSS, rightPlane, rightTransform);
     planeTransforms.push_back(rightTransform);
 }
+
 
 static vector<double> checkViewPositionRelativeToPlanes(const vector<Matrix4>& planeTransforms) {
     // 현재 카메라 위치
@@ -324,12 +374,12 @@ static vector<double> checkViewPositionRelativeToPlanes(const vector<Matrix4>& p
         // 카메라 위치와 Plane 간 상대 Y좌표 계산
         double relativeY = dot(viewPosition - planeCenter, planeNormal);
 
-        cout << "Plane " << i + 1 << " - Relative Y Position: " << relativeY << " ("
-            << (relativeY > 0 ? "Front" : (relativeY < 0 ? "Back" : "On the Plane")) << ")" << endl;
+        //cout << "Plane " << i + 1 << " - Relative Y Position: " << relativeY << " ("
+        //    << (relativeY > 0 ? "Front" : (relativeY < 0 ? "Back" : "On the Plane")) << ")" << endl;
 
         relativeYPositions.push_back(relativeY); // 결과 저장
     }
-    cout << "==================================================" << endl;
+    //cout << "==================================================" << endl;
     return relativeYPositions; // Y 좌표 벡터 반환
 }
 
@@ -356,36 +406,37 @@ static void drawStuff() {
     Matrix4 MVM = invEyeRbt * groundRbt;
     Matrix4 NMVM = normalMatrix(MVM);
     sendModelViewNormalMatrix(curSS, MVM, NMVM);
-    safe_glUniform3f(curSS.h_uColor, 0.1, 0.95, 0.1); // set color
+    safe_glUniform3f(curSS.h_uColor, 0.0, 1.0, 0.0); // set color
     g_ground->draw(curSS);
-
-    //// 지붕
-    //auto roofPlane = createPlane(6.0, 3.0);
-    ////drawPlane(curSS, roofPlane, Matrix4::makeTranslation(Cvec3(0.0, 3.0, -2.0)), Cvec3(0.1, 0.1, 0.1));
 
     // 모든 Plane의 변환 행렬 저장
     vector<Matrix4> planeTransforms;
 
-    //1동
-    createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)), Cvec3(0.99, 0.99, 0.99), planeTransforms);
-
-    //2동
-    createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(-90), Cvec3(0.99, 0.99, 0.99), planeTransforms);
-
-    //3동
-    createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(90), Cvec3(0.99, 0.99, 0.99), planeTransforms);
-    // 3-3번 벽면
-    auto Plane_3_3 = createPlane(5.0, 10.0);
-    drawPlane(curSS, Plane_3_3, Matrix4::makeTranslation(Cvec3(-2.5, 0.5, 7.5)) * Matrix4::makeZRotation(90), Cvec3(0.99, 0.99, 0.99));
-    // 3-1번 벽면
-    auto Plane_3_1 = createPlane(5.0, 10.0);
-    drawPlane(curSS, Plane_3_1, Matrix4::makeTranslation(Cvec3(2.5, 0.5, 7.5)) * Matrix4::makeZRotation(90), Cvec3(0.99, 0.99, 0.99));
-
+    // 구조물 텍스처 활성화 (공통 텍스처 사용)
+    glActiveTexture(GL_TEXTURE0);          // 활성화할 텍스처 유닛
+    glBindTexture(GL_TEXTURE_2D, wallTextureID); // 구조물 텍스처 바인딩
+    glUniform1i(safe_glGetUniformLocation(curSS.program, "uTexture"), 0); // uTexture에 텍스처 유닛 0 연결
     // 카메라와 Plane의 상대 위치 계산 및 출력
     checkViewPositionRelativeToPlanes(planeTransforms);
+ 
 
-    //4동
-    //createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(90), Cvec3(0.99, 0.99, 0.99), );
+    // 1동
+    createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)), planeTransforms);
+
+    // 2동
+    createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(-90), planeTransforms);
+
+    // 3동
+    createStructure(curSS, Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(90), planeTransforms);
+
+    // 3-3번 벽면
+    auto Plane_3_3 = createTexturedPlane(5.0, 10.0);
+    drawPlane(curSS, Plane_3_3, Matrix4::makeTranslation(Cvec3(-2.5, 0.5, 7.5)) * Matrix4::makeZRotation(90));
+
+    // 3-1번 벽면
+    auto Plane_3_1 = createTexturedPlane(5.0, 10.0);
+    drawPlane(curSS, Plane_3_1, Matrix4::makeTranslation(Cvec3(2.5, 0.5, 7.5)) * Matrix4::makeZRotation(90));
+
 
 }
 
@@ -410,38 +461,35 @@ static void reshape(const int w, const int h) {
     glutPostRedisplay();
 }
 
+
 static void motion(const int x, const int y) {
-    // 마우스 이동의 변화량 계산
-    const double dx = x - g_mouseClickX;
-    const double dy = g_mouseClickY - y; // OpenGL의 Y축 좌표는 아래에서 위로 증가
+    // 마우스 움직임 변화량 계산
+    const double dx = x - g_windowWidth / 2;
+    const double dy = g_windowHeight / 2 - y; // OpenGL의 Y축 좌표는 위로 증가
 
-    // 좌클릭이 눌려 있는 경우: 카메라 뷰 회전
-    if (g_mouseLClickButton) {
-        // 기존 상태에서 Yaw와 Pitch를 업데이트
-        g_yaw += -dx * 0.2;  // 좌우 회전
-        g_pitch += dy * 0.2; // 상하 회전
+    // Yaw와 Pitch 업데이트
+    g_yaw += -dx * 0.2;  // 좌우 회전
+    g_pitch += dy * 0.2; // 상하 회전
 
-        // Pitch 제한: -90도 ~ 90도
-        if (g_pitch > 89.0) g_pitch = 89.0;
-        if (g_pitch < -89.0) g_pitch = -89.0;
+    // Pitch 제한: -90도 ~ 90도
+    if (g_pitch > 89.0) g_pitch = 89.0;
+    if (g_pitch < -89.0) g_pitch = -89.0;
 
-        // 새로운 뷰 행렬 계산
-        Matrix4 yawRotation = Matrix4::makeYRotation(g_yaw);
-        Matrix4 pitchRotation = Matrix4::makeXRotation(g_pitch);
+    // 새로운 뷰 행렬 계산
+    Matrix4 yawRotation = Matrix4::makeYRotation(g_yaw);
+    Matrix4 pitchRotation = Matrix4::makeXRotation(g_pitch);
 
-        // 기존의 위치 정보 유지
-        Cvec3 currentTranslation = Cvec3(g_skyRbt(0, 3), g_skyRbt(1, 3), g_skyRbt(2, 3));
+    // 기존의 위치 정보 유지
+    Cvec3 currentTranslation = Cvec3(g_skyRbt(0, 3), g_skyRbt(1, 3), g_skyRbt(2, 3));
 
-        // 새로운 변환 행렬 계산
-        g_skyRbt = yawRotation * pitchRotation;
-        g_skyRbt(0, 3) = currentTranslation[0];
-        g_skyRbt(1, 3) = currentTranslation[1];
-        g_skyRbt(2, 3) = currentTranslation[2];
-    }
+    // 새로운 변환 행렬 계산
+    g_skyRbt = yawRotation * pitchRotation;
+    g_skyRbt(0, 3) = currentTranslation[0];
+    g_skyRbt(1, 3) = currentTranslation[1];
+    g_skyRbt(2, 3) = currentTranslation[2];
 
-    // 마우스 위치 갱신
-    g_mouseClickX = x;
-    g_mouseClickY = y;
+    // 마우스 커서를 창 중앙으로 이동
+    glutWarpPointer(g_windowWidth / 2, g_windowHeight / 2);
 
     glutPostRedisplay(); // 화면 갱신
 }
@@ -495,11 +543,11 @@ static void keyboard(const unsigned char key, const int x, const int y) {
         vector<Matrix4> planeTransforms;
 
         // 1동
-        createStructure(*g_shaderStates[g_activeShader], Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)), Cvec3(0.99, 0.99, 0.99), planeTransforms);
+        createStructure(*g_shaderStates[g_activeShader], Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)), planeTransforms);
         // 2동
-        createStructure(*g_shaderStates[g_activeShader], Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(-90), Cvec3(0.99, 0.99, 0.99), planeTransforms);
+        createStructure(*g_shaderStates[g_activeShader], Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(-90), planeTransforms);
         // 3동
-        createStructure(*g_shaderStates[g_activeShader], Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(90), Cvec3(0.99, 0.99, 0.99), planeTransforms);
+        createStructure(*g_shaderStates[g_activeShader], Matrix4::makeTranslation(Cvec3(0.0, 0.0, 0.0)) * Matrix4::makeYRotation(90), planeTransforms);
 
         vector<double> relativeYPositions = checkViewPositionRelativeToPlanes(planeTransforms);
 
@@ -585,16 +633,21 @@ static void keyboard(const unsigned char key, const int x, const int y) {
     glutPostRedisplay();
 }
 
+
 static void initGlutState(int argc, char* argv[]) {
     glutInit(&argc, argv);                                  // initialize Glut based on cmd-line args
     glutInitDisplayMode(GLUT_RGBA | GLUT_DOUBLE | GLUT_DEPTH);  //  RGBA pixel channels and double buffering
     glutInitWindowSize(g_windowWidth, g_windowHeight);      // create a window
     glutCreateWindow("Assignment 2 - Basic 3D");            // title the window
+
+    ShowCursor(FALSE);
+
     glutDisplayFunc(display);                               // display rendering callback
     glutReshapeFunc(reshape);                               // window reshape callback
-    glutMotionFunc(motion);                                 // mouse movement callback
     glutMouseFunc(mouse);                                   // mouse click callback
     glutKeyboardFunc(keyboard);
+    glutPassiveMotionFunc(motion);
+
 }
 
 static void initGLState() {
@@ -623,8 +676,15 @@ static void initShaders() {
 }
 
 
+static void initTextures() {
+    loadTexture("wall.ppm", wallTextureID);
+    glBindTexture(GL_TEXTURE_2D, wallTextureID);
+}
+
+
 static void initGeometry() {
     initGround();
+    initTextures(); // 텍스처 초기화 추가
 }
 
 int main(int argc, char* argv[]) {
